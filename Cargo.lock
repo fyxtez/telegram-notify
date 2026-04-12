@@ -1405,7 +1405,6 @@ checksum = "20f34339676cdcab560c9a82300c4c2581f68b9369aedf0fae86f2ff9565ff3e"
 name = "telegram-notify"
 version = "1.0.0"
 dependencies = [
- "once_cell",
  "teloxide",
  "tokio",
 ]

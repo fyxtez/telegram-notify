@@ -20,15 +20,15 @@
 //! }
 //! ```
 
-use once_cell::sync::OnceCell;
 use std::env;
+use std::sync::OnceLock;
 use teloxide::prelude::*;
 use teloxide::types::ChatId;
 
 /// Maximum Telegram text message length.
 const MAX_MESSAGE_LEN: usize = 4096;
 
-static CLIENT: OnceCell<(Bot, ChatId)> = OnceCell::new();
+static BOT: OnceLock<Bot> = OnceLock::new();
 
 /// Errors returned by this crate.
 #[derive(Debug)]
@@ -79,23 +79,26 @@ fn validated_message(msg: &str) -> Result<&str, NotifyError> {
     Ok(msg)
 }
 
-fn load_config() -> Result<(String, ChatId), NotifyError> {
-    let token =
-        env::var("TELEGRAM_BOT_TOKEN").map_err(|_| NotifyError::MissingEnv("TELEGRAM_BOT_TOKEN"))?;
+fn load_bot_token() -> Result<String, NotifyError> {
+    env::var("TELEGRAM_BOT_TOKEN").map_err(|_| NotifyError::MissingEnv("TELEGRAM_BOT_TOKEN"))
+}
 
+fn load_chat_id() -> Result<ChatId, NotifyError> {
     let chat_id = env::var("TELEGRAM_CHAT_ID")
         .map_err(|_| NotifyError::MissingEnv("TELEGRAM_CHAT_ID"))?
         .parse::<i64>()
         .map_err(|_| NotifyError::InvalidChatId)?;
 
-    Ok((token, ChatId(chat_id)))
+    Ok(ChatId(chat_id))
 }
 
-fn client() -> Result<&'static (Bot, ChatId), NotifyError> {
-    CLIENT.get_or_try_init(|| {
-        let (token, chat_id) = load_config()?;
-        Ok((Bot::new(token), chat_id))
-    })
+fn bot() -> Result<&'static Bot, NotifyError> {
+    if let Some(bot) = BOT.get() {
+        return Ok(bot);
+    }
+
+    let token = load_bot_token()?;
+    Ok(BOT.get_or_init(|| Bot::new(token)))
 }
 
 /// Sends a plain text Telegram message to the configured chat.
@@ -114,9 +117,10 @@ fn client() -> Result<&'static (Bot, ChatId), NotifyError> {
 /// - Telegram rejects the request
 pub async fn send(msg: &str) -> Result<(), NotifyError> {
     let msg = validated_message(msg)?;
+    let bot = bot()?;
+    let chat_id = load_chat_id()?;
 
-    let (bot, chat_id) = client()?;
-    bot.send_message(*chat_id, msg).await?;
+    bot.send_message(chat_id, msg).await?;
 
     Ok(())
 }
@@ -124,10 +128,13 @@ pub async fn send(msg: &str) -> Result<(), NotifyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
 
-    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn display_messages_exist() {
@@ -166,57 +173,62 @@ mod tests {
     }
 
     #[test]
-    fn load_config_missing_token() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn load_bot_token_missing() {
+        let _guard = env_lock().lock().unwrap();
 
         unsafe {
             env::remove_var("TELEGRAM_BOT_TOKEN");
-            env::remove_var("TELEGRAM_CHAT_ID");
-            env::set_var("TELEGRAM_CHAT_ID", "123");
         }
 
-        let err = load_config().unwrap_err();
+        let err = load_bot_token().unwrap_err();
         assert!(matches!(err, NotifyError::MissingEnv("TELEGRAM_BOT_TOKEN")));
     }
 
     #[test]
-    fn load_config_missing_chat_id() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn load_bot_token_ok() {
+        let _guard = env_lock().lock().unwrap();
 
         unsafe {
             env::set_var("TELEGRAM_BOT_TOKEN", "test_token");
+        }
+
+        let token = load_bot_token().unwrap();
+        assert_eq!(token, "test_token");
+    }
+
+    #[test]
+    fn load_chat_id_missing() {
+        let _guard = env_lock().lock().unwrap();
+
+        unsafe {
             env::remove_var("TELEGRAM_CHAT_ID");
         }
 
-        let err = load_config().unwrap_err();
+        let err = load_chat_id().unwrap_err();
         assert!(matches!(err, NotifyError::MissingEnv("TELEGRAM_CHAT_ID")));
     }
 
     #[test]
-    fn load_config_invalid_chat_id() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn load_chat_id_invalid() {
+        let _guard = env_lock().lock().unwrap();
 
         unsafe {
-            env::set_var("TELEGRAM_BOT_TOKEN", "test_token");
             env::set_var("TELEGRAM_CHAT_ID", "not_a_number");
         }
 
-        let err = load_config().unwrap_err();
+        let err = load_chat_id().unwrap_err();
         assert!(matches!(err, NotifyError::InvalidChatId));
     }
 
     #[test]
-    fn load_config_ok() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn load_chat_id_ok() {
+        let _guard = env_lock().lock().unwrap();
 
         unsafe {
-            env::set_var("TELEGRAM_BOT_TOKEN", "test_token");
             env::set_var("TELEGRAM_CHAT_ID", "123");
         }
 
-        let (token, chat_id) = load_config().unwrap();
-        assert_eq!(token, "test_token");
+        let chat_id = load_chat_id().unwrap();
         assert_eq!(chat_id, ChatId(123));
     }
-
 }
