@@ -17,7 +17,7 @@ configured chat.
 
 ``` toml
 [dependencies]
-telegram-notify = { path = "../telegram-notify" }
+telegram-notify = "1.0.0"
 tokio = { version = "1", features = ["rt", "macros"] }
 ```
 
