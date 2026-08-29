@@ -1,14 +1,14 @@
 //! Tiny async Telegram notification crate.
 //!
-//! This crate provides a minimal `send` API for sending Telegram bot messages
-//! to a single configured chat.
+//! This crate provides minimal `send` and `send_html` APIs for sending Telegram
+//! bot messages to a single configured chat.
 //!
 //! # Environment variables
 //!
 //! - `TELEGRAM_BOT_TOKEN`
 //! - `TELEGRAM_CHAT_ID`
 //!
-//! # Example
+//! # Plain text example
 //!
 //! ```no_run
 //! use telegram_notify::send;
@@ -19,13 +19,26 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # HTML example
+//!
+//! ```no_run
+//! use telegram_notify::{escape_html, send_html};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), telegram_notify::NotifyError> {
+//!     let text = escape_html("BTC < 100k & moving fast");
+//!     send_html(&format!("<b>Alert</b>\n{text}")).await?;
+//!     Ok(())
+//! }
+//! ```
 
 use std::env;
 use std::sync::OnceLock;
 use teloxide::prelude::*;
-use teloxide::types::ChatId;
+use teloxide::types::{ChatId, LinkPreviewOptions, ParseMode};
 
-/// Maximum Telegram text message length.
+/// Maximum Telegram plain-text message length.
 const MAX_MESSAGE_LEN: usize = 4096;
 
 static BOT: OnceLock<Bot> = OnceLock::new();
@@ -39,7 +52,7 @@ pub enum NotifyError {
     InvalidChatId,
     /// Message is empty after trimming whitespace.
     EmptyMessage,
-    /// Message exceeds Telegram's 4096 character limit.
+    /// Plain-text message exceeds Telegram's 4096 character limit.
     MessageTooLong,
     /// Telegram API request failed.
     Telegram(teloxide::RequestError),
@@ -57,7 +70,14 @@ impl std::fmt::Display for NotifyError {
     }
 }
 
-impl std::error::Error for NotifyError {}
+impl std::error::Error for NotifyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Telegram(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 impl From<teloxide::RequestError> for NotifyError {
     fn from(err: teloxide::RequestError) -> Self {
@@ -65,12 +85,18 @@ impl From<teloxide::RequestError> for NotifyError {
     }
 }
 
-fn validated_message(msg: &str) -> Result<&str, NotifyError> {
+fn validated_non_empty(msg: &str) -> Result<&str, NotifyError> {
     let msg = msg.trim();
 
     if msg.is_empty() {
         return Err(NotifyError::EmptyMessage);
     }
+
+    Ok(msg)
+}
+
+fn validated_message(msg: &str) -> Result<&str, NotifyError> {
+    let msg = validated_non_empty(msg)?;
 
     if msg.chars().count() > MAX_MESSAGE_LEN {
         return Err(NotifyError::MessageTooLong);
@@ -101,6 +127,28 @@ fn bot() -> Result<&'static Bot, NotifyError> {
     Ok(BOT.get_or_init(|| Bot::new(token)))
 }
 
+/// Escapes dynamic text so it can be safely inserted into a Telegram HTML
+/// message.
+///
+/// Telegram's HTML parser treats `<`, `>`, `&`, and `"` specially. Escaping
+/// these characters before interpolating user/API content prevents tweet text,
+/// names, or URLs from accidentally breaking the surrounding markup.
+pub fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            _ => escaped.push(ch),
+        }
+    }
+
+    escaped
+}
+
 /// Sends a plain text Telegram message to the configured chat.
 ///
 /// The target chat is taken from the `TELEGRAM_CHAT_ID` environment variable,
@@ -121,6 +169,49 @@ pub async fn send(msg: &str) -> Result<(), NotifyError> {
     let chat_id = load_chat_id()?;
 
     bot.send_message(chat_id, msg).await?;
+
+    Ok(())
+}
+
+/// Sends Telegram HTML to the configured chat.
+///
+/// HTML parsing is enabled and link previews are kept enabled above the text.
+/// This makes the common hidden-link pattern useful for media previews:
+///
+/// ```text
+/// <a href="https://example.com/image.jpg">&#8205;</a><b>Alert</b>
+/// ```
+///
+/// Dynamic content interpolated into `html` should be passed through
+/// [`escape_html`] first.
+///
+/// Telegram applies its 4096-character limit after parsing entities, so this
+/// function intentionally does not reject HTML based on raw markup length.
+/// Telegram remains the source of truth for the final parsed-message limit.
+///
+/// # Errors
+///
+/// Returns an error if required environment variables are missing, the chat ID
+/// is invalid, the HTML is empty after trimming, or Telegram rejects it.
+pub async fn send_html(html: &str) -> Result<(), NotifyError> {
+    let html = validated_non_empty(html)?;
+    let bot = bot()?;
+    let chat_id = load_chat_id()?;
+
+    // FEATURE: keep preview media above the formatted body. Callers can select
+    // a concrete preview by placing a zero-width HTML link first in the message.
+    let link_preview = LinkPreviewOptions {
+        is_disabled: false,
+        url: None,
+        prefer_small_media: false,
+        prefer_large_media: true,
+        show_above_text: true,
+    };
+
+    bot.send_message(chat_id, html)
+        .parse_mode(ParseMode::Html)
+        .link_preview_options(link_preview)
+        .await?;
 
     Ok(())
 }
@@ -170,6 +261,23 @@ mod tests {
     fn validated_message_trims_ok() {
         let msg = validated_message("  hello  ").unwrap();
         assert_eq!(msg, "hello");
+    }
+
+    #[test]
+    fn html_validation_only_rejects_empty_content() {
+        assert_eq!(validated_non_empty("  <b>hello</b>  ").unwrap(), "<b>hello</b>");
+        assert!(matches!(
+            validated_non_empty(" \n\t ").unwrap_err(),
+            NotifyError::EmptyMessage
+        ));
+    }
+
+    #[test]
+    fn escape_html_protects_telegram_markup() {
+        assert_eq!(
+            escape_html("BTC < 100k & \"moving\" > fast"),
+            "BTC &lt; 100k &amp; &quot;moving&quot; &gt; fast"
+        );
     }
 
     #[test]

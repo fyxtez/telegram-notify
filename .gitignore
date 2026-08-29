@@ -1,3 +1,7 @@
 /target
 .env
 copy.sh
+TODO.md
+
+zip.sh
+*.zip
