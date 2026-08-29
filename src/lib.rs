@@ -1,47 +1,92 @@
 //! Tiny async Telegram notification crate.
 //!
-//! This crate provides minimal `send` and `send_html` APIs for sending Telegram
-//! bot messages to a single configured chat.
+//! This crate provides minimal `send` and generic `send_html` APIs for sending
+//! bot notifications to one configured chat.
 //!
 //! # Environment variables
 //!
 //! - `TELEGRAM_BOT_TOKEN`
 //! - `TELEGRAM_CHAT_ID`
-//!
-//! # Plain text example
-//!
-//! ```no_run
-//! use telegram_notify::send;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), telegram_notify::NotifyError> {
-//!     send("trade executed").await?;
-//!     Ok(())
-//! }
-//! ```
-//!
-//! # HTML example
-//!
-//! ```no_run
-//! use telegram_notify::{escape_html, send_html};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), telegram_notify::NotifyError> {
-//!     let text = escape_html("BTC < 100k & moving fast");
-//!     send_html(&format!("<b>Alert</b>\n{text}")).await?;
-//!     Ok(())
-//! }
-//! ```
 
 use std::env;
 use std::sync::OnceLock;
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, LinkPreviewOptions, ParseMode};
+use teloxide::types::{
+    ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, LinkPreviewOptions, ParseMode,
+};
+use url::Url;
 
 /// Maximum Telegram plain-text message length.
 const MAX_MESSAGE_LEN: usize = 4096;
 
 static BOT: OnceLock<Bot> = OnceLock::new();
+
+/// Optional media attached to a [`HtmlMessage`].
+///
+/// Images can still use Telegram's normal link preview mechanism. `Video` is
+/// useful when a direct MP4 URL would otherwise render as a plain link instead
+/// of visual media in a normal `sendMessage` preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HtmlMedia {
+    Photo(String),
+    Video(String),
+}
+
+/// Generic HTML message options for [`send_html`].
+///
+/// `send_html("<b>Hello</b>")` remains valid through the `From<&str>` impl,
+/// while callers that need Telegram-native media or an inline URL button can
+/// build an `HtmlMessage` explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlMessage {
+    html: String,
+    media: Option<HtmlMedia>,
+    button: Option<(String, String)>,
+}
+
+impl HtmlMessage {
+    pub fn new(html: impl Into<String>) -> Self {
+        Self {
+            html: html.into(),
+            media: None,
+            button: None,
+        }
+    }
+
+    pub fn photo(mut self, url: impl Into<String>) -> Self {
+        self.media = Some(HtmlMedia::Photo(url.into()));
+        self
+    }
+
+    pub fn video(mut self, url: impl Into<String>) -> Self {
+        self.media = Some(HtmlMedia::Video(url.into()));
+        self
+    }
+
+    /// Adds one generic Telegram URL button below the message.
+    pub fn button(mut self, text: impl Into<String>, url: impl Into<String>) -> Self {
+        self.button = Some((text.into(), url.into()));
+        self
+    }
+}
+
+impl From<&str> for HtmlMessage {
+    fn from(html: &str) -> Self {
+        Self::new(html)
+    }
+}
+
+impl From<&String> for HtmlMessage {
+    fn from(html: &String) -> Self {
+        Self::new(html.clone())
+    }
+}
+
+impl From<String> for HtmlMessage {
+    fn from(html: String) -> Self {
+        Self::new(html)
+    }
+}
 
 /// Errors returned by this crate.
 #[derive(Debug)]
@@ -50,6 +95,8 @@ pub enum NotifyError {
     MissingEnv(&'static str),
     /// `TELEGRAM_CHAT_ID` could not be parsed as `i64`.
     InvalidChatId,
+    /// A media/button URL is invalid.
+    InvalidUrl(String),
     /// Message is empty after trimming whitespace.
     EmptyMessage,
     /// Plain-text message exceeds Telegram's 4096 character limit.
@@ -63,6 +110,7 @@ impl std::fmt::Display for NotifyError {
         match self {
             Self::MissingEnv(name) => write!(f, "missing environment variable: {name}"),
             Self::InvalidChatId => write!(f, "invalid TELEGRAM_CHAT_ID"),
+            Self::InvalidUrl(url) => write!(f, "invalid URL: {url}"),
             Self::EmptyMessage => write!(f, "message is empty"),
             Self::MessageTooLong => write!(f, "message exceeds 4096 characters"),
             Self::Telegram(err) => write!(f, "telegram request failed: {err}"),
@@ -105,6 +153,10 @@ fn validated_message(msg: &str) -> Result<&str, NotifyError> {
     Ok(msg)
 }
 
+fn parse_url(url: &str) -> Result<Url, NotifyError> {
+    Url::parse(url).map_err(|_| NotifyError::InvalidUrl(url.to_string()))
+}
+
 fn load_bot_token() -> Result<String, NotifyError> {
     env::var("TELEGRAM_BOT_TOKEN").map_err(|_| NotifyError::MissingEnv("TELEGRAM_BOT_TOKEN"))
 }
@@ -127,12 +179,18 @@ fn bot() -> Result<&'static Bot, NotifyError> {
     Ok(BOT.get_or_init(|| Bot::new(token)))
 }
 
-/// Escapes dynamic text so it can be safely inserted into a Telegram HTML
-/// message.
-///
-/// Telegram's HTML parser treats `<`, `>`, `&`, and `"` specially. Escaping
-/// these characters before interpolating user/API content prevents tweet text,
-/// names, or URLs from accidentally breaking the surrounding markup.
+fn inline_keyboard(button: Option<&(String, String)>) -> Result<Option<InlineKeyboardMarkup>, NotifyError> {
+    let Some((text, url)) = button else {
+        return Ok(None);
+    };
+
+    // FEATURE: URL buttons are kept generic in telegram-notify so applications
+    // can add actions such as "View Tweet" without coupling this crate to X.
+    let button = InlineKeyboardButton::url(text.clone(), parse_url(url)?);
+    Ok(Some(InlineKeyboardMarkup::new([[button]])))
+}
+
+/// Escapes dynamic text so it can be safely inserted into Telegram HTML.
 pub fn escape_html(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
 
@@ -150,68 +208,79 @@ pub fn escape_html(text: &str) -> String {
 }
 
 /// Sends a plain text Telegram message to the configured chat.
-///
-/// The target chat is taken from the `TELEGRAM_CHAT_ID` environment variable,
-/// and the bot token is taken from `TELEGRAM_BOT_TOKEN`.
-///
-/// # Errors
-///
-/// Returns an error if:
-///
-/// - required environment variables are missing
-/// - `TELEGRAM_CHAT_ID` is invalid
-/// - the message is empty after trimming
-/// - the message exceeds Telegram's 4096 character limit
-/// - Telegram rejects the request
 pub async fn send(msg: &str) -> Result<(), NotifyError> {
     let msg = validated_message(msg)?;
     let bot = bot()?;
     let chat_id = load_chat_id()?;
 
     bot.send_message(chat_id, msg).await?;
-
     Ok(())
 }
 
-/// Sends Telegram HTML to the configured chat.
+/// Sends a generic Telegram HTML message to the configured chat.
 ///
-/// HTML parsing is enabled and link previews are kept enabled above the text.
-/// This makes the common hidden-link pattern useful for media previews:
+/// A plain string keeps the original `send_html(&html)` behavior. Build an
+/// [`HtmlMessage`] when you also need a native photo/video or one inline URL
+/// button below the message.
 ///
-/// ```text
-/// <a href="https://example.com/image.jpg">&#8205;</a><b>Alert</b>
-/// ```
-///
-/// Dynamic content interpolated into `html` should be passed through
-/// [`escape_html`] first.
-///
-/// Telegram applies its 4096-character limit after parsing entities, so this
-/// function intentionally does not reject HTML based on raw markup length.
-/// Telegram remains the source of truth for the final parsed-message limit.
-///
-/// # Errors
-///
-/// Returns an error if required environment variables are missing, the chat ID
-/// is invalid, the HTML is empty after trimming, or Telegram rejects it.
-pub async fn send_html(html: &str) -> Result<(), NotifyError> {
-    let html = validated_non_empty(html)?;
+/// Without native media, link previews remain enabled above the text so the
+/// zero-width first-link pattern continues to work for image previews.
+pub async fn send_html(message: impl Into<HtmlMessage>) -> Result<(), NotifyError> {
+    let message = message.into();
+    let html = validated_non_empty(&message.html)?.to_string();
     let bot = bot()?;
     let chat_id = load_chat_id()?;
+    let keyboard = inline_keyboard(message.button.as_ref())?;
 
-    // FEATURE: keep preview media above the formatted body. Callers can select
-    // a concrete preview by placing a zero-width HTML link first in the message.
-    let link_preview = LinkPreviewOptions {
-        is_disabled: false,
-        url: None,
-        prefer_small_media: false,
-        prefer_large_media: true,
-        show_above_text: true,
-    };
+    match message.media {
+        Some(HtmlMedia::Photo(url)) => {
+            let mut request = bot
+                .send_photo(chat_id, InputFile::url(parse_url(&url)?))
+                .caption(html)
+                .parse_mode(ParseMode::Html)
+                .show_caption_above_media(true);
 
-    bot.send_message(chat_id, html)
-        .parse_mode(ParseMode::Html)
-        .link_preview_options(link_preview)
-        .await?;
+            if let Some(keyboard) = keyboard {
+                request = request.reply_markup(keyboard);
+            }
+
+            request.await?;
+        }
+        Some(HtmlMedia::Video(url)) => {
+            let mut request = bot
+                .send_video(chat_id, InputFile::url(parse_url(&url)?))
+                .caption(html)
+                .parse_mode(ParseMode::Html)
+                .show_caption_above_media(true)
+                .supports_streaming(true);
+
+            if let Some(keyboard) = keyboard {
+                request = request.reply_markup(keyboard);
+            }
+
+            request.await?;
+        }
+        None => {
+            let link_preview = LinkPreviewOptions {
+                is_disabled: false,
+                url: None,
+                prefer_small_media: false,
+                prefer_large_media: true,
+                show_above_text: true,
+            };
+
+            let mut request = bot
+                .send_message(chat_id, html)
+                .parse_mode(ParseMode::Html)
+                .link_preview_options(link_preview);
+
+            if let Some(keyboard) = keyboard {
+                request = request.reply_markup(keyboard);
+            }
+
+            request.await?;
+        }
+    }
 
     Ok(())
 }
@@ -229,19 +298,28 @@ mod tests {
 
     #[test]
     fn display_messages_exist() {
-        assert_eq!(
-            NotifyError::MissingEnv("X").to_string(),
-            "missing environment variable: X"
-        );
-        assert_eq!(
-            NotifyError::InvalidChatId.to_string(),
-            "invalid TELEGRAM_CHAT_ID"
-        );
+        assert_eq!(NotifyError::MissingEnv("X").to_string(), "missing environment variable: X");
+        assert_eq!(NotifyError::InvalidChatId.to_string(), "invalid TELEGRAM_CHAT_ID");
         assert_eq!(NotifyError::EmptyMessage.to_string(), "message is empty");
-        assert_eq!(
-            NotifyError::MessageTooLong.to_string(),
-            "message exceeds 4096 characters"
-        );
+        assert_eq!(NotifyError::MessageTooLong.to_string(), "message exceeds 4096 characters");
+        assert_eq!(NotifyError::InvalidUrl("bad".into()).to_string(), "invalid URL: bad");
+    }
+
+    #[test]
+    fn html_message_builder_preserves_generic_options() {
+        let message = HtmlMessage::new("<b>hello</b>")
+            .video("https://example.com/test.mp4")
+            .button("Open", "https://example.com");
+
+        assert_eq!(message.html, "<b>hello</b>");
+        assert_eq!(message.media, Some(HtmlMedia::Video("https://example.com/test.mp4".into())));
+        assert_eq!(message.button, Some(("Open".into(), "https://example.com".into())));
+    }
+
+    #[test]
+    fn invalid_button_url_is_rejected_before_request() {
+        let button = ("Open".to_string(), "not a url".to_string());
+        assert!(matches!(inline_keyboard(Some(&button)), Err(NotifyError::InvalidUrl(_))));
     }
 
     #[test]
@@ -266,28 +344,18 @@ mod tests {
     #[test]
     fn html_validation_only_rejects_empty_content() {
         assert_eq!(validated_non_empty("  <b>hello</b>  ").unwrap(), "<b>hello</b>");
-        assert!(matches!(
-            validated_non_empty(" \n\t ").unwrap_err(),
-            NotifyError::EmptyMessage
-        ));
+        assert!(matches!(validated_non_empty(" \n\t ").unwrap_err(), NotifyError::EmptyMessage));
     }
 
     #[test]
     fn escape_html_protects_telegram_markup() {
-        assert_eq!(
-            escape_html("BTC < 100k & \"moving\" > fast"),
-            "BTC &lt; 100k &amp; &quot;moving&quot; &gt; fast"
-        );
+        assert_eq!(escape_html("BTC < 100k & \"moving\" > fast"), "BTC &lt; 100k &amp; &quot;moving&quot; &gt; fast");
     }
 
     #[test]
     fn load_bot_token_missing() {
         let _guard = env_lock().lock().unwrap();
-
-        unsafe {
-            env::remove_var("TELEGRAM_BOT_TOKEN");
-        }
-
+        unsafe { env::remove_var("TELEGRAM_BOT_TOKEN"); }
         let err = load_bot_token().unwrap_err();
         assert!(matches!(err, NotifyError::MissingEnv("TELEGRAM_BOT_TOKEN")));
     }
@@ -295,11 +363,7 @@ mod tests {
     #[test]
     fn load_bot_token_ok() {
         let _guard = env_lock().lock().unwrap();
-
-        unsafe {
-            env::set_var("TELEGRAM_BOT_TOKEN", "test_token");
-        }
-
+        unsafe { env::set_var("TELEGRAM_BOT_TOKEN", "test_token"); }
         let token = load_bot_token().unwrap();
         assert_eq!(token, "test_token");
     }
@@ -307,11 +371,7 @@ mod tests {
     #[test]
     fn load_chat_id_missing() {
         let _guard = env_lock().lock().unwrap();
-
-        unsafe {
-            env::remove_var("TELEGRAM_CHAT_ID");
-        }
-
+        unsafe { env::remove_var("TELEGRAM_CHAT_ID"); }
         let err = load_chat_id().unwrap_err();
         assert!(matches!(err, NotifyError::MissingEnv("TELEGRAM_CHAT_ID")));
     }
@@ -319,11 +379,7 @@ mod tests {
     #[test]
     fn load_chat_id_invalid() {
         let _guard = env_lock().lock().unwrap();
-
-        unsafe {
-            env::set_var("TELEGRAM_CHAT_ID", "not_a_number");
-        }
-
+        unsafe { env::set_var("TELEGRAM_CHAT_ID", "not_a_number"); }
         let err = load_chat_id().unwrap_err();
         assert!(matches!(err, NotifyError::InvalidChatId));
     }
@@ -331,11 +387,7 @@ mod tests {
     #[test]
     fn load_chat_id_ok() {
         let _guard = env_lock().lock().unwrap();
-
-        unsafe {
-            env::set_var("TELEGRAM_CHAT_ID", "123");
-        }
-
+        unsafe { env::set_var("TELEGRAM_CHAT_ID", "123"); }
         let chat_id = load_chat_id().unwrap();
         assert_eq!(chat_id, ChatId(123));
     }

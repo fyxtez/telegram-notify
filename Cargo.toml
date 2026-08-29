@@ -1,9 +1,9 @@
 [package]
 name = "telegram-notify"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 license = "MIT"
-description = "Tiny async Rust crate for sending Telegram bot text and HTML messages"
+description = "Tiny async Rust crate for sending Telegram bot text and rich HTML messages"
 repository = "https://github.com/fyxtez/telegram-notify"
 readme = "README.md"
 keywords = ["telegram", "bot", "notifications", "alerting"]
@@ -12,3 +12,4 @@ categories = ["api-bindings", "network-programming"]
 [dependencies]
 teloxide = "0.17"
 tokio = { version = "1.51.1", features = ["rt", "macros"] }
+url = "2"

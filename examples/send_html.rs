@@ -1,20 +1,23 @@
-use telegram_notify::{escape_html, send_html};
+use telegram_notify::{escape_html, send_html, HtmlMessage};
 
-/// Sends a formatted HTML message with a media preview above the text.
+/// Sends formatted HTML with an image preview and an inline URL button.
 ///
-/// Run with:
-/// TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... cargo run --example send_html
+/// To also test native video delivery, set TELEGRAM_TEST_VIDEO_URL to a public
+/// direct MP4 URL before running the example.
 #[tokio::main]
 async fn main() -> Result<(), telegram_notify::NotifyError> {
     let preview_url = "https://www.rust-lang.org/logos/rust-logo-512x512.png";
     let dynamic_text = escape_html("HTML works: BTC < 100k & still moving.");
-
-    // The zero-width first link selects the preview without printing a raw URL
-    // in the visible message body. send_html keeps that preview above the text.
     let html = format!(
-        "<a href=\"{preview_url}\">&#8205;</a><b>telegram-notify HTML test</b>\n\n{dynamic_text}\n\n<blockquote><b>Embedded block</b>\nThis is how nested content can be rendered.</blockquote>"
+        "<a href=\"{preview_url}\">&#8205;</a><b>telegram-notify HTML test</b>\n\n{dynamic_text}\n\n<blockquote><b>Embedded block</b>\nRich HTML can include Telegram media and buttons.</blockquote>"
     );
 
-    send_html(&html).await?;
+    let mut message = HtmlMessage::new(html).button("Open Rust ↗", "https://www.rust-lang.org/");
+
+    if let Ok(video_url) = std::env::var("TELEGRAM_TEST_VIDEO_URL") {
+        message = message.video(video_url);
+    }
+
+    send_html(message).await?;
     Ok(())
 }
